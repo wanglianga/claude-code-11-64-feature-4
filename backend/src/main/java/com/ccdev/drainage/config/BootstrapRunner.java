@@ -1,11 +1,14 @@
 package com.ccdev.drainage.config;
 
+import com.ccdev.drainage.dto.Requests;
 import com.ccdev.drainage.repo.AnalysisRepository;
 import com.ccdev.drainage.repo.AssetRepository;
 import com.ccdev.drainage.repo.DatasetRepository;
+import com.ccdev.drainage.repo.ProtocolRepository;
 import com.ccdev.drainage.service.AlignmentService;
 import com.ccdev.drainage.service.ClusteringService;
 import com.ccdev.drainage.service.DatasetService;
+import com.ccdev.drainage.service.ProtocolMigrationService;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.core.io.ClassPathResource;
@@ -33,11 +36,14 @@ public class BootstrapRunner implements ApplicationRunner {
     private final AnalysisRepository analysisRepo;
     private final DatasetRepository datasetRepo;
     private final AssetRepository assetRepo;
+    private final ProtocolRepository protocolRepo;
+    private final ProtocolMigrationService migrationService;
 
     public BootstrapRunner(JdbcTemplate jdbc, AlignmentService alignmentService,
                            ClusteringService clusteringService, DatasetService datasetService,
                            AnalysisRepository analysisRepo, DatasetRepository datasetRepo,
-                           AssetRepository assetRepo) {
+                           AssetRepository assetRepo, ProtocolRepository protocolRepo,
+                           ProtocolMigrationService migrationService) {
         this.jdbc = jdbc;
         this.alignmentService = alignmentService;
         this.clusteringService = clusteringService;
@@ -45,6 +51,8 @@ public class BootstrapRunner implements ApplicationRunner {
         this.analysisRepo = analysisRepo;
         this.datasetRepo = datasetRepo;
         this.assetRepo = assetRepo;
+        this.protocolRepo = protocolRepo;
+        this.migrationService = migrationService;
     }
 
     @Override
@@ -70,6 +78,15 @@ public class BootstrapRunner implements ApplicationRunner {
                     + datasetService.generateForVersion(latestVersion, "MAX_SEVERITY", 1L));
             System.out.println("[bootstrap] 生成 BURDEN 数据集: "
                     + datasetService.generateForVersion(latestVersion, "BURDEN", 1L));
+        }
+        // 判读规程迁移：首次启动按新规程对全部历史观察做一次全量重放（只增不改的迁移运行）
+        if (protocolRepo.findProtocolByCode("CCT-2026").isPresent()
+                && protocolRepo.findAllRuns().isEmpty()) {
+            var cct2026 = protocolRepo.findProtocolByCode("CCT-2026").orElseThrow();
+            var run = migrationService.run(new Requests.ProtocolRunRequest(cct2026.id(), null,
+                    "FULL_REPLAY", null, null, null, "启动引导全量重放"), 1L);
+            System.out.println("[bootstrap] 判读规程迁移全量重放: " + run.get("runCode")
+                    + " / " + run.get("summary"));
         }
     }
 }

@@ -136,3 +136,160 @@ SELECT setval(pg_get_serial_sequence('app_segment_mapping','id'),    (SELECT max
 SELECT setval(pg_get_serial_sequence('app_contractor_batch','id'),   (SELECT max(id) FROM app_contractor_batch));
 SELECT setval(pg_get_serial_sequence('app_video','id'),              (SELECT max(id) FROM app_video));
 SELECT setval(pg_get_serial_sequence('app_observation','id'),        (SELECT max(id) FROM app_observation));
+
+-- ============================================================================
+-- 判读规程迁移样例（虚构）
+--   旧规程 CCT-2021：裂缝/变形/渗漏/接口错位 各按 1-4 级整类判定
+--   新规程 CCT-2026：裂缝按宽度与渗漏拆为多个类别；变形按挠度拆；接口错位按错位量拆
+--   规程 CCT-2026-R1：再次修订（仅调整渗漏门槛），用于验证“再次修订不得修改既有运行”
+-- 场景覆盖：
+--   * 类别拆分：旧裂缝 III → 新 CRACK_WIDE_SEEPS / CRACK_WIDE_DRY
+--   * 字段不足：裂缝宽度在旧视频中不可测量 ⇒ EVIDENCE_GAP，禁止由旧等级反推
+--   * 候选歧义：缺少渗漏迹象 ⇒ 保留两个候选，不任选其一
+--   * 有效期边界：CCT-2026 自 2025-03-01 起适用；R1 自 2026-01-01 起适用，
+--     因此 R1 运行中 2025 年两批检查标为“检查早于生效日，不适用”，只有 2026-03 批次适用
+--     （按检查发生日判断，不按导入日期套用）
+--   * 跨类别依赖：接口错位 III 的错位量取自同管段重叠渗漏观察的渗漏迹象
+-- ============================================================================
+
+-- ---------------------------------------------------------------- 规程
+INSERT INTO app_protocol
+ (id, protocol_code, name, effective_from, effective_to, approval_source, status, parent_protocol_id, note) VALUES
+ (1, 'CCT-2021', '旧版缺陷判读规程（2021）', DATE '2021-01-01', DATE '2025-02-28',
+     '市住建局《城镇排水管道检测与评估技术规程》CJJ 181-2012 附录', 'SUPERSEDED', NULL,
+     '整类分级：裂缝/变形/渗漏/接口错位按 1-4 级'),
+ (2, 'CCT-2026', '新版缺陷判读规程（2026）', DATE '2025-03-01', NULL,
+     '市水务局 2025 年第 3 号技术通告，经市政工程处 2025-01 评审批准', 'ACTIVE', 1,
+     '裂缝按宽度与渗漏拆分、变形按挠度拆分、接口错位按错位量拆分'),
+ (3, 'CCT-2026-R1', '新版判读规程第一次修订（2026-R1）', DATE '2026-01-01', NULL,
+     '市水务局 2025 年第 9 号技术通告（补登接口错位跨类别依赖索引）', 'ACTIVE', 2,
+     '修订文本自同日替代 CCT-2026：仅补登接口错位跨类别依赖索引，用于验证既有运行不被改写')
+ON CONFLICT (protocol_code) DO NOTHING;
+
+-- 旧规程类别定义快照（规则差异与迁移映射的来源）
+INSERT INTO app_protocol_legacy_category
+ (protocol_id, category_code, category_name, defect_type, min_grade, max_grade, note) VALUES
+ (1, 'LEG-CRACK',  '裂缝（旧）',      'CRACK',              1, 4, '按整类 1-4 级'),
+ (1, 'LEG-DEFORM', '变形（旧）',      'DEFORMATION',        1, 4, '按整类 1-4 级'),
+ (1, 'LEG-LEAK',   '渗漏（旧）',      'LEAK',               1, 4, '按整类 1-4 级'),
+ (1, 'LEG-JOINT',  '接口错位（旧）',  'JOINT_DISLOCATION',  1, 4, '按整类 1-4 级')
+ON CONFLICT (protocol_id, category_code) DO NOTHING;
+
+-- 新规程类别定义：必要观察字段直接写在 required_fields
+INSERT INTO app_protocol_category
+ (id, protocol_id, category_code, category_name, defect_type, min_grade, max_grade, required_fields,
+  severity_grade, enabled, note) VALUES
+ (1, 2, 'CRACK_NARROW',        '窄裂缝（宽度<2mm）',          'CRACK',             1, 4, 'crack_width_mm',                    2, true, '按宽度细分，不涉及渗漏'),
+ (2, 2, 'CRACK_WIDE_SEEPS',    '宽裂缝伴渗漏（宽度≥2mm）',    'CRACK',             2, 4, 'crack_width_mm,seepage',            4, true, '宽度≥2mm 且存在渗漏迹象'),
+ (3, 2, 'CRACK_WIDE_DRY',      '宽裂缝无渗漏（宽度≥2mm）',    'CRACK',             2, 4, 'crack_width_mm,seepage',            3, true, '宽度≥2mm 但无渗漏迹象'),
+ (4, 2, 'DEFORM_MINOR',        '轻微变形（挠度<5%）',         'DEFORMATION',       1, 4, 'deflection_pct',                    2, true, '按挠度细分'),
+ (5, 2, 'DEFORM_MAJOR',        '显著变形（挠度≥5%）',         'DEFORMATION',       2, 4, 'deflection_pct',                    4, true, '按挠度细分'),
+ (6, 2, 'LEAK_SEEP',           '渗漏（渗出）',                'LEAK',              1, 4, 'leak_rate_lpm',                     3, true, '按渗漏量细分'),
+ (7, 2, 'JOINT_HORIZONTAL',    '接口横向错位（<20mm）',       'JOINT_DISLOCATION', 1, 4, 'offset_mm',                         2, true, '按错位量细分'),
+ (8, 2, 'JOINT_VERTICAL',      '接口纵向错位（≥20mm）',       'JOINT_DISLOCATION', 1, 4, 'offset_mm',                         4, true, '按错位量细分')
+ON CONFLICT (protocol_id, category_code) DO NOTHING;
+
+-- 修订版 R1：继承 CCT-2026 的类别定义，仅调整宽裂缝伴渗漏的等级门槛
+INSERT INTO app_protocol_category
+ (id, protocol_id, category_code, category_name, defect_type, min_grade, max_grade, required_fields,
+  severity_grade, enabled, note) VALUES
+ (9,  3, 'CRACK_NARROW',     '窄裂缝（宽度<2mm）',       'CRACK',             1, 4, 'crack_width_mm',         2, true, '沿用 CCT-2026'),
+ (10, 3, 'CRACK_WIDE_SEEPS', '宽裂缝伴渗漏（宽度≥2mm）', 'CRACK',             2, 4, 'crack_width_mm,seepage', 4, true, 'R1 沿用，仅补登依赖索引'),
+ (11, 3, 'CRACK_WIDE_DRY',   '宽裂缝无渗漏（宽度≥2mm）', 'CRACK',             2, 4, 'crack_width_mm,seepage', 3, true, '沿用 CCT-2026'),
+ (12, 3, 'DEFORM_MINOR',     '轻微变形（挠度<5%）',      'DEFORMATION',       1, 4, 'deflection_pct',         2, true, '沿用 CCT-2026'),
+ (13, 3, 'DEFORM_MAJOR',     '显著变形（挠度≥5%）',      'DEFORMATION',       2, 4, 'deflection_pct',         4, true, '沿用 CCT-2026'),
+ (14, 3, 'LEAK_SEEP',        '渗漏（渗出）',             'LEAK',              1, 4, 'leak_rate_lpm',          3, true, '沿用 CCT-2026'),
+ (15, 3, 'JOINT_HORIZONTAL', '接口横向错位（<20mm）',    'JOINT_DISLOCATION', 1, 4, 'offset_mm',              2, true, '沿用 CCT-2026'),
+ (16, 3, 'JOINT_VERTICAL',   '接口纵向错位（≥20mm）',    'JOINT_DISLOCATION', 1, 4, 'offset_mm',              4, true, '沿用 CCT-2026')
+ON CONFLICT (protocol_id, category_code) DO NOTHING;
+
+-- 必要观察字段字典：recoverability 决定缺失时是“证据不足”还是“候选歧义”
+INSERT INTO app_protocol_field (field_code, field_name, value_type, unit, recoverability, description) VALUES
+ ('crack_width_mm', '裂缝宽度', 'NUMERIC', 'mm', 'NOT_MEASURABLE_FROM_ARCHIVE',
+     '旧视频分辨率不足以回溯测量宽度，缺失时必须判证据不足，禁止由旧等级反推'),
+ ('deflection_pct', '变形挠度', 'NUMERIC', '%', 'NOT_MEASURABLE_FROM_ARCHIVE',
+     '旧视频无法回溯测量挠度百分比，缺失时必须判证据不足'),
+ ('seepage',        '渗漏迹象', 'CODE',    NULL, 'NOT_RECORDED',
+     '旧归档未逐条登记渗漏迹象，缺失时保留“伴渗漏/无渗漏”多个候选'),
+ ('leak_rate_lpm',  '渗漏量',   'NUMERIC', 'L/min', 'NOT_MEASURABLE_FROM_ARCHIVE',
+     '渗漏量需现场量测，旧归档缺失时判证据不足'),
+ ('offset_mm',      '接口错位量', 'NUMERIC', 'mm', 'NOT_RECORDED',
+     '错位量部分归档有记录；缺失时保留横向/纵向多个候选')
+ON CONFLICT (field_code) DO NOTHING;
+
+-- 拆分关系：旧类别 → 新类别（条件表达式由 ProtocolRuleEngine 求值）
+INSERT INTO app_protocol_split
+ (id, from_protocol_id, from_category_code, to_protocol_id, to_category_code, condition_expr, priority, note) VALUES
+ (1, 1, 'LEG-CRACK',  2, 'CRACK_NARROW',      'crack_width_mm < 2',                                10, '旧裂缝按宽度拆分为窄裂缝'),
+ (2, 1, 'LEG-CRACK',  2, 'CRACK_WIDE_SEEPS',  'crack_width_mm >= 2 AND seepage = TRUE',            20, '宽裂缝且存在渗漏迹象'),
+ (3, 1, 'LEG-CRACK',  2, 'CRACK_WIDE_DRY',    'crack_width_mm >= 2 AND seepage = FALSE',           30, '宽裂缝但无渗漏迹象'),
+ (4, 1, 'LEG-DEFORM', 2, 'DEFORM_MINOR',      'deflection_pct < 5',                                10, '旧变形按挠度拆分'),
+ (5, 1, 'LEG-DEFORM', 2, 'DEFORM_MAJOR',      'deflection_pct >= 5',                               20, '显著变形'),
+ (6, 1, 'LEG-LEAK',   2, 'LEAK_SEEP',         'leak_rate_lpm >= 0',                                10, '旧渗漏整类归并为渗出'),
+ (7, 1, 'LEG-JOINT',  2, 'JOINT_HORIZONTAL',  'offset_mm < 20',                                    10, '接口错位按错位量拆分'),
+ (8, 1, 'LEG-JOINT',  2, 'JOINT_VERTICAL',    'offset_mm >= 20',                                   20, '纵向错位'),
+-- 修订版 R1 复用同一份旧类别拆分定义
+ (9,  1, 'LEG-CRACK',  3, 'CRACK_NARROW',     'crack_width_mm < 2',                                10, 'R1 沿用'),
+ (10, 1, 'LEG-CRACK',  3, 'CRACK_WIDE_SEEPS', 'crack_width_mm >= 2 AND seepage = TRUE',            20, 'R1 沿用'),
+ (11, 1, 'LEG-CRACK',  3, 'CRACK_WIDE_DRY',   'crack_width_mm >= 2 AND seepage = FALSE',           30, 'R1 沿用'),
+ (12, 1, 'LEG-DEFORM', 3, 'DEFORM_MINOR',     'deflection_pct < 5',                                10, 'R1 沿用'),
+ (13, 1, 'LEG-DEFORM', 3, 'DEFORM_MAJOR',     'deflection_pct >= 5',                               20, 'R1 沿用'),
+ (14, 1, 'LEG-LEAK',   3, 'LEAK_SEEP',        'leak_rate_lpm >= 0',                                10, 'R1 沿用'),
+ (15, 1, 'LEG-JOINT',  3, 'JOINT_HORIZONTAL', 'offset_mm < 20',                                    10, 'R1 沿用'),
+ (16, 1, 'LEG-JOINT',  3, 'JOINT_VERTICAL',   'offset_mm >= 20',                                   20, 'R1 沿用')
+ON CONFLICT (from_protocol_id, from_category_code, to_protocol_id, to_category_code) DO NOTHING;
+
+-- 依赖索引：哪些原始字段参与了哪些新类别判定
+--   CCT-2026 故意遗漏 JOINT_VERTICAL.offset_mm，用于展示“依赖索引缺口”告警与增量旧口径风险
+INSERT INTO app_protocol_dependency
+ (protocol_id, category_code, field_name, source_field, source_defect_type, dependency_kind, condition_expr, note) VALUES
+ (2, 'CRACK_NARROW',     'crack_width_mm', 'crack_width_mm', 'CRACK',             'SELF',           'crack_width_mm < 2',            '自身归档字段'),
+ (2, 'CRACK_WIDE_SEEPS', 'crack_width_mm', 'crack_width_mm', 'CRACK',             'SELF',           'crack_width_mm >= 2',           '自身归档字段'),
+ (2, 'CRACK_WIDE_SEEPS', 'seepage',        'seepage',        'CRACK',             'SELF',           'seepage = TRUE',                '自身归档字段'),
+ (2, 'CRACK_WIDE_DRY',   'crack_width_mm', 'crack_width_mm', 'CRACK',             'SELF',           'crack_width_mm >= 2',           '自身归档字段'),
+ (2, 'CRACK_WIDE_DRY',   'seepage',        'seepage',        'CRACK',             'SELF',           'seepage = FALSE',               '自身归档字段'),
+ (2, 'DEFORM_MINOR',     'deflection_pct', 'deflection_pct', 'DEFORMATION',       'SELF',           'deflection_pct < 5',            '自身归档字段'),
+ (2, 'DEFORM_MAJOR',     'deflection_pct', 'deflection_pct', 'DEFORMATION',       'SELF',           'deflection_pct >= 5',           '自身归档字段'),
+ (2, 'LEAK_SEEP',        'leak_rate_lpm',  'leak_rate_lpm',  'LEAK',              'SELF',           'leak_rate_lpm >= 0',            '自身归档字段'),
+ (2, 'JOINT_HORIZONTAL', 'offset_mm',      'offset_mm',      'JOINT_DISLOCATION', 'CROSS_CATEGORY', 'offset_mm < 20',
+     '错位量取同管段重叠接口错位观察的现场量测'),
+ (3, 'CRACK_NARROW',     'crack_width_mm', 'crack_width_mm', 'CRACK',             'SELF',           'crack_width_mm < 2',            'R1 沿用'),
+ (3, 'CRACK_WIDE_SEEPS', 'crack_width_mm', 'crack_width_mm', 'CRACK',             'SELF',           'crack_width_mm >= 2',           'R1 沿用'),
+ (3, 'CRACK_WIDE_SEEPS', 'seepage',        'seepage',        'CRACK',             'SELF',           'seepage = TRUE',                'R1 沿用'),
+ (3, 'CRACK_WIDE_DRY',   'crack_width_mm', 'crack_width_mm', 'CRACK',             'SELF',           'crack_width_mm >= 2',           'R1 沿用'),
+ (3, 'CRACK_WIDE_DRY',   'seepage',        'seepage',        'CRACK',             'SELF',           'seepage = FALSE',               'R1 沿用'),
+ (3, 'DEFORM_MINOR',     'deflection_pct', 'deflection_pct', 'DEFORMATION',       'SELF',           'deflection_pct < 5',            'R1 沿用'),
+ (3, 'DEFORM_MAJOR',     'deflection_pct', 'deflection_pct', 'DEFORMATION',       'SELF',           'deflection_pct >= 5',           'R1 沿用'),
+ (3, 'LEAK_SEEP',        'leak_rate_lpm',  'leak_rate_lpm',  'LEAK',              'SELF',           'leak_rate_lpm >= 0',            'R1 沿用'),
+ (3, 'JOINT_HORIZONTAL', 'offset_mm',      'offset_mm',      'JOINT_DISLOCATION', 'CROSS_CATEGORY', 'offset_mm < 20',
+     'R1 沿用'),
+ (3, 'JOINT_VERTICAL',   'offset_mm',      'offset_mm',      'JOINT_DISLOCATION', 'CROSS_CATEGORY', 'offset_mm >= 20',
+     'R1 补登：CCT-2026 遗漏的依赖，修订后补齐')
+ON CONFLICT (protocol_id, category_code, field_name) DO NOTHING;
+
+-- 已归档的原始观察可量化字段（宽度/挠度/渗漏等）
+--   OBS-1（裂缝 II，WS-001[10,12.5]）：有宽度 3.2mm，但无渗漏登记 ⇒ 候选歧义
+--   OBS-3（裂缝 B=2，WS-001 同位置反向复检）：有宽度 1.5mm ⇒ 窄裂缝，可判定
+--   OBS-9（裂缝 II，重叠片段）：无宽度（旧画面不可测量）⇒ 证据不足
+--   OBS-10（裂缝 III，WS-003）：无宽度 ⇒ 证据不足
+--   OBS-13（裂缝 C=3，WS-003 反向复检）：有宽度 2.4mm、有渗漏 TRUE ⇒ 宽裂缝伴渗漏
+--   OBS-4（变形 D=4，WS-001[39,40]）：无挠度 ⇒ 证据不足
+--   OBS-11（变形 IV，WS-003[21,23]）：有挠度 6.5% ⇒ 显著变形
+--   OBS-5（接口错位 III，WS-002[15,15.5]）：自身无错位量，旧规程依赖索引未登记 ⇒ 候选歧义；
+--          R1 补齐跨类别依赖后，可从同管段重叠观察 OBS-6（22mm）判定为纵向错位
+--   OBS-2（渗漏 III，WS-001[30,31]）：有渗漏量 1.8
+INSERT INTO app_observation_field (observation_id, field_name, field_value, source) VALUES
+ (1,  'crack_width_mm', '3.2',  'ARCHIVE_FRAME'),
+ (3,  'crack_width_mm', '1.5',  'ARCHIVE_FRAME'),
+ (13, 'crack_width_mm', '2.4',  'ARCHIVE_FRAME'),
+ (13, 'seepage',        'TRUE', 'CONTRACTOR_SHEET'),
+ (11, 'deflection_pct', '6.5',  'ARCHIVE_FRAME'),
+ (6,  'offset_mm',      '22',   'CONTRACTOR_SHEET'),
+ (2,  'leak_rate_lpm',  '1.8',  'ARCHIVE_FRAME')
+ON CONFLICT (observation_id, field_name) DO NOTHING;
+
+-- 校正规程域显式插入后的 identity 序列
+SELECT setval(pg_get_serial_sequence('app_protocol','id'),           (SELECT max(id) FROM app_protocol));
+SELECT setval(pg_get_serial_sequence('app_protocol_category','id'),  (SELECT max(id) FROM app_protocol_category));
+SELECT setval(pg_get_serial_sequence('app_protocol_split','id'),     (SELECT max(id) FROM app_protocol_split));
+SELECT setval(pg_get_serial_sequence('app_observation_field','id'),  (SELECT max(id) FROM app_observation_field));

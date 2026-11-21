@@ -14,6 +14,7 @@ const routes = [
       { path: 'clusters', name: 'clusters', component: () => import('../views/ClustersView.vue') },
       { path: 'datasets', name: 'datasets', component: () => import('../views/DatasetsView.vue') },
       { path: 'rules', name: 'rules', component: () => import('../views/RulesView.vue') },
+      { path: 'protocols', name: 'protocols', component: () => import('../views/ProtocolsView.vue') },
       { path: 'audit', name: 'audit', component: () => import('../views/AuditView.vue') }
     ]
   }

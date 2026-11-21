@@ -36,4 +36,18 @@ public final class Requests {
 
     public record AdjudicateRequest(@NotNull Integer resolvedGrade, @NotBlank String note) {
     }
+
+    // ------------------------------------------------------------ 判读规程迁移
+    public record ProtocolRunRequest(@NotNull Long targetProtocolId, Long baseProtocolId,
+                                     @NotBlank String mode, Long previousRunId, Long versionId,
+                                     java.util.List<String> changedCategoryCodes, String note) {
+    }
+
+    public record ShadowReviewRequest(@NotBlank String decision, String chosenCategory, @NotBlank String note) {
+    }
+
+    public record ProtocolDependencyRequest(@NotBlank String categoryCode, @NotBlank String fieldName,
+                                            @NotBlank String sourceField, @NotBlank String sourceDefectType,
+                                            String dependencyKind, String conditionExpr, String note) {
+    }
 }
